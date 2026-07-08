@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>普拉托定律 - 点画（Stippling）微生物海报</title>
+    <style>
+        @font-face {
+            font-family: 'HelveticaNeueLight';
+            src: url('./HelveticaNeueLight.otf') format('opentype');
+        }
+        @font-face {
+            font-family: 'HelveticaNeueMedium';
+            src: url('./HelveticaNeueMedium.otf') format('opentype');
+        }
+        body { 
+            margin: 0; 
+            padding: 0; 
+            background: #555555;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            overflow: hidden; 
+        }
+        #poster {
+            position: relative;
+            background: #bcbcbc; /* 浅灰色背景 */
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+        }
+        canvas, svg { 
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%; 
+            height: 100%;
+            display: block;
+        }
+        svg {
+            z-index: 10; /* SVG 放上层专门处理透明的拖拽交互 */
+        }
+        #hand-cursor {
+            position: absolute;
+            width: 30px;
+            height: 30px;
+            background: transparent;
+            border: none;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 1000;
+            transform: translate(-50%, -50%);
+            display: none;
+            box-shadow: 0 0 20px 8px rgba(255, 255, 255, 0.4); 
+            transition: transform 0.1s, box-shadow 0.1s;
+        }
+        #hand-cursor.pinched {
+            box-shadow: 0 0 30px 15px rgba(255, 255, 255, 0.8);
+            transform: translate(-50%, -50%) scale(0.6);
+        }
+    </style>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+    <svg style="width:0;height:0;position:absolute;">
+        <defs>
+            <filter id="goo">
+                <feGaussianBlur in="SourceGraphic" stdDeviation="6" result="blur" />
+                <feColorMatrix in="blur" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 18 -7" result="goo" />
+            </filter>
+        </defs>
+    </svg>
+    <div id="poster">
+        <canvas id="blob-layer" style="display: none;"></canvas>
+        <canvas id="render-layer"></canvas>
+        <svg id="hit-layer"></svg>
+        <div id="hand-cursor"></div>
+    </div>
+    <video id="input_video" style="display:none;" autoplay playsinline></video>
+
+    <script>
+        let width = window.innerWidth;
+        let height = window.innerHeight;
+        
+        const canvasDom = document.getElementById("render-layer");
+        canvasDom.width = width;
+        canvasDom.height = height;
+        const ctx = canvasDom.getContext("2d");
+
+        const blobDom = document.getElementById("blob-layer");
+        blobDom.width = width;
+        blobDom.height = height;
+        const blobCtx = blobDom.getContext("2d");
+
+        const svg = d3.select("#hit-layer").attr("viewBox", [0, 0, width, height]);
+
+        window.addEventListener('resize', () => {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvasDom.width = width;
+            canvasDom.height = height;
+            blobDom.width = width;
+            blobDom.height = height;
+            svg.attr("viewBox", [0, 0, width, height]);
+            if (typeof simulation !== 'undefined') {
+                simulation.force("center", d3.forceCenter(width / 2, height / 2).strength(0.005));
+                simulation.alpha(0.3).restart();
+            }
+        });
+
+        let nodes = [];
+        let nextId = 1;
+
+        let autoAnimationState = "waiting"; 
+        let fallingChars = []; 
+        let currentBubble = null;
+        let typingTimeout = null;
+        let introTextAlphaMultiplier = 1.0;
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key.length !== 1) return;
+
+            if (!currentBubble) {
+                let startX = width / 2 + (Math.random() - 0.5) * 50;
+                let startY = height / 2 + (Math.random() - 0.5) * 50;
+                
+                if (nodes.length >= 3) {
+                    startX = width * 0.1 + Math.random() * (width * 0.8);
+                    startY = height * 0.1 + Math.random() * (height * 0.8);
+                }
+
+                currentBubble = {
+                    id: nextId++,
+                    x: startX,
+                    y: startY,
+                    r: 5,
+                    targetR: 30, 
+                    typedText: "",
+                    lastDrawnChars: []
+                };
+                nodes.push(currentBubble);
+
+                enforceBubbleLimit();
+
+                simulation.nodes(nodes);
+            }
+
+            currentBubble.typedText += e.key;
+            currentBubble.targetR += 10; 
+
+            let padding = 80;
+            let maxR = Math.min(width, height) / 2 - padding;
+
+            if (currentBubble.targetR > maxR) {
+                burstBubble(currentBubble);
+                currentBubble = null;
+                clearTimeout(typingTimeout);
+            } else {
+                clearTimeout(typingTimeout);
+                typingTimeout = setTimeout(() => {
+                    currentBubble = null;
+                }, 1500);
+            }
+
+            simulation.alpha(0.8).restart();
+        });
+
+        function burstBubble(bubble) {
+            let index = nodes.indexOf(bubble);
+            if (index === -1) return;
+            let removed = nodes.splice(index, 1)[0];
+            
+            if (removed.lastDrawnChars) {
+                for(let charData of removed.lastDrawnChars) {
+                    let dx = charData.x - removed.x;
+                    let dy = charData.y - removed.y;
+                    let dist = Math.sqrt(dx*dx + dy*dy);
+                    let dirX = dist > 0 ? dx / dist : (Math.random() - 0.5);
+                    let dirY = dist > 0 ? dy / dist : (Math.random() - 0.5);
+                    let force = 15 + Math.random() * 20; 
+                    
+                    fallingChars.push({
+                        x: charData.x,
+                        y: charData.y,
+                        vx: dirX * force + (Math.random() - 0.5) * 5, 
+                        vy: dirY * force + (Math.random() - 0.5) * 10 - 15, 
+                        color: charData.color,
+                        size: charData.size,
+                        char: charData.char
+                    });
+                }
+            }
+            simulation.nodes(nodes);
+            simulation.alpha(0.8).restart();
+        }
+
+        // 限制泡泡绝对上限，防止短时间内疯狂点击生成太多导致卡顿，保留为 12
+        function enforceBubbleLimit() {
+            while (nodes.length > 12) {
+                burstBubble(nodes[0]);
+            }
+        }
+
+        // ================= 新增：高低水位线自动清理逻辑 =================
+        let isAutoBursting = false; // 记录当前是否处于清理状态
+
+        function scheduleRandomBurst() {
+            // 时间稍微调快一点 (4~8秒)，让 10 降到 3 的过程节奏更好，不会显得过于漫长
+            let randomDelay = 4000 + Math.random() * 4000; 
+            
+            setTimeout(() => {
+                // 1. 状态机制判断
+                if (nodes.length >= 10) {
+                    isAutoBursting = true;  // 达到10个，开启清理模式
+                } else if (nodes.length <= 3) {
+                    isAutoBursting = false; // 降到3个，关闭清理模式
+                }
+
+                // 2. 只有处于清理模式时，才会执行破碎
+                if (isAutoBursting) {
+                    // 筛选出可以被戳破的泡泡（排除掉当前正在打字的那个，以免打断输入）
+                    let burstableNodes = nodes.filter(n => n !== currentBubble);
+                    
+                    if (burstableNodes.length > 0) {
+                        let randomIndex = Math.floor(Math.random() * burstableNodes.length);
+                        burstBubble(burstableNodes[randomIndex]);
+                    }
+                }
+                
+                // 无限循环：安排下一次的检测
+                scheduleRandomBurst();
+            }, randomDelay);
+        }
+        
+        // 启动随机破碎定时器
+        scheduleRandomBurst();
+        // ================================================================
+
+        function pseudoRandom(seedA, seedB) {
+            let t = Math.sin(seedA * 12.9898 + seedB * 78.233) * 43758.5453123;
+            return t - Math.floor(t);
+        }
+
+        function getRadius(seedA, seedB) {
+            let noise = pseudoRandom(seedA, seedB); 
+            let wave = Math.sin(seedA * 0.08) * Math.cos(seedB * 0.08); 
+            return Math.max(2, (1.5 + noise * 4.5 + wave * 2) * 4.0); 
+        }
+
+        function clipPolygon(poly, px, py, nx, ny) {
+            if (!poly || poly.length === 0) return [];
+            let out = [];
+            for (let i = 0; i < poly.length; i++) {
+                let cur = poly[i];
+                let prev = poly[(i === 0 ? poly.length - 1 : i - 1)];
+                
+                let dCur = (cur[0] - px) * nx + (cur[1] - py) * ny;
+                let dPrev = (prev[0] - px) * nx + (prev[1] - py) * ny;
+                
+                if (dCur * dPrev < 0) {
+                    let t = dPrev / (dPrev - dCur);
+                    let ix = prev[0] + t * (cur[0] - prev[0]);
+                    let iy = prev[1] + t * (cur[1] - prev[1]);
+                    out.push([ix, iy]);
+                }
+                
+                if (dCur <= 0) {
+                    out.push(cur);
+                }
+            }
+            return out;
+        }
+
+        function surfaceTensionForce(alpha) {
+            for (let i = 0; i < nodes.length; i++) {
+                for (let j = i + 1; j < nodes.length; j++) {
+                    let n1 = nodes[i], n2 = nodes[j];
+                    let sumR = n1.r + n2.r;
+                    
+                    let dx = n2.x - n1.x;
+                    let dy = n2.y - n1.y;
+                    let dist = Math.sqrt(dx*dx + dy*dy);
+                    if (dist === 0) continue;
+
+                    if (dist < sumR * 1.2) { 
+                        let target = sumR * 0.86; 
+                        let diff = dist - target; 
+                        
+                        let force = diff * 0.15 * alpha; 
+                        let fx = (dx/dist) * force;
+                        let fy = (dy/dist) * force;
+                        
+                        let m1 = n1.r * n1.r;
+                        let m2 = n2.r * n2.r;
+                        let mSum = m1 + m2;
+                        
+                        n1.vx += fx * (m2 / mSum);
+                        n2.vx -= fx * (m1 / mSum);
+                    }
+                }
+            }
+        }
+
+        const simulation = d3.forceSimulation(nodes)
+            .force("charge", d3.forceManyBody().strength(-30)) 
+            .force("center", d3.forceCenter(width / 2, height / 2).strength(0.005))
+            .force("surfaceTension", surfaceTensionForce)
+            .force("wander", () => {
+                let time = Date.now() * 0.001;
+                for(let n of nodes) {
+                    n.vx += Math.sin(time + n.id) * 0.15;
+                    n.vy += Math.cos(time * 0.8 + n.id * 1.5) * 0.15;
+                }
+            })
+            .force("boundary", () => {
+                let padding = 80; 
+                for(let n of nodes) {
+                    n.x = Math.max(n.r + padding, Math.min(width - n.r - padding, n.x));
+                    n.y = Math.max(n.r + padding, Math.min(height - n.r - padding, n.y));
+                }
+            })
+            .alphaDecay(0.01)
+            .alphaTarget(0.02)
+            .on("tick", render);
+
+        const drag = d3.drag()
+            .on("start", (event, d) => {
+                if (!event.active) simulation.alphaTarget(0.3).restart();
+                d.fx = d.x; d.fy = d.y;
+            })
+            .on("drag", (event, d) => {
+                d.fx = event.x; d.fy = event.y;
+            })
+            .on("end", (event, d) => {
+                if (!event.active) simulation.alphaTarget(0.02);
+                d.fx = null; d.fy = null;
+            });
+
+        d3.select("#poster").on("dblclick", (event) => {
+            let pointer = d3.pointer(event, svg.node());
+            nodes.push({
+                id: nextId++,
+                x: pointer[0] || (width/2 + (Math.random()-0.5)*100),
+                y: pointer[1] || (height/2 + (Math.random()-0.5)*100),
+                r: 5,
+                targetR: 40 + Math.random() * 260, 
+                typedText: " ",
+                lastDrawnChars: []
+            });
+            
+            enforceBubbleLimit();
+            
+            simulation.nodes(nodes);
+            simulation.alpha(1).restart();
+        });
+
+        function render() {
+            let drawnTextBounds = []; 
+
+            nodes.forEach(n => {
+                n.lastDrawnChars = []; 
+                if (n.targetR && n.r < n.targetR) {
+                    n.r += (n.targetR - n.r) * 0.2; 
+                }
+            });
+
+            ctx.clearRect(0, 0, width, height);
+            blobCtx.clearRect(0, 0, width, height);
+
+            nodes.forEach(n => {
+                let poly = [ [-200, -200], [width+200, -200], [width+200, height+200], [-200, height+200] ];
+                let planes = []; 
+
+                for(let j of nodes) {
+                    if (n === j) continue;
+                    let dx = j.x - n.x;
+                    let dy = j.y - n.y;
+                    let d2 = dx*dx + dy*dy;
+                    if(d2 === 0) continue;
+                    
+                    let d = Math.sqrt(d2);
+                    if(d > n.r + j.r) continue; 
+                    
+                    let d_i = (d2 + n.r*n.r - j.r*j.r) / (2*d);
+                    let px = n.x + dx * d_i / d;
+                    let py = n.y + dy * d_i / d;
+                    let nx = dx / d;
+                    let ny = dy / d;
+                    
+                    planes.push({px, py, nx, ny, neighborId: j.id});
+                    poly = clipPolygon(poly, px, py, nx, ny);
+                }
+                
+                for (let i = 0; i < poly.length; i++) {
+                    let p1 = poly[i];
+                    let p2 = poly[(i === poly.length - 1) ? 0 : i + 1];
+                    
+                    let pA = p1, pB = p2;
+                    if (pA[0] > pB[0] || (pA[0] === pB[0] && pA[1] > pB[1])) {
+                        pA = p2; pB = p1;
+                    }
+                    
+                    let dx = pB[0] - pA[0];
+                    let dy = pB[1] - pA[1];
+                    let len = Math.sqrt(dx*dx + dy*dy);
+                    if (len === 0) continue;
+                    
+                    let midX = (pA[0] + pB[0]) / 2;
+                    let midY = (pA[1] + pB[1]) / 2;
+                    let neighborId = 0;
+                    for (let plane of planes) {
+                        let dCur = (midX - plane.px) * plane.nx + (midY - plane.py) * plane.ny;
+                        if (Math.abs(dCur) < 0.1) {
+                            neighborId = plane.neighborId;
+                            break;
+                        }
+                    }
+                    
+                    let currentDist = 0;
+                    let k = 0;
+                    while (currentDist < len) {
+                        let seedA = n.id + neighborId * 1000;
+                        let seedB = k;
+                        let r = getRadius(seedA, seedB);
+                        let totalR = r + 4; 
+                        
+                        let centerDist = currentDist + totalR;
+                        currentDist += totalR * 2 - 0.2; 
+                        
+                        if (centerDist > len) break;
+                        
+                        let t = centerDist / len;
+                        let ptX = pA[0] + dx * t;
+                        let ptY = pA[1] + dy * t;
+                        k++;
+                        
+                        let dist2 = (ptX - n.x)*(ptX - n.x) + (ptY - n.y)*(ptY - n.y);
+                        if (dist2 <= (n.r + 4) * (n.r + 4)) {
+                            let hasBlob = pseudoRandom(seedA, seedB + 1111) < 0.6; 
+                            
+                            if (hasBlob) {
+                                blobCtx.fillStyle = "#ffffff"; 
+                                blobCtx.beginPath();
+                                blobCtx.arc(ptX, ptY, r + 4, 0, Math.PI * 2);
+                                blobCtx.fill();
+                            }
+
+                            if (n.id < neighborId && centerDist >= 15 && (len - centerDist) >= 15) {
+                                let fontSize = Math.max(16, r * 1.8);
+                                let isOverlap = false;
+                                for (let b of drawnTextBounds) {
+                                    let dx = ptX - b.x; let dy = ptY - b.y;
+                                    if (dx*dx + dy*dy < (fontSize * 0.45 + b.r) * (fontSize * 0.45 + b.r)) { 
+                                        isOverlap = true; break; 
+                                    }
+                                }
+                                if (!isOverlap) {
+                                    drawnTextBounds.push({x: ptX, y: ptY, r: fontSize * 0.45});
+                                    let textSource = n.typedText && n.typedText.length > 0 ? n.typedText : " ";
+                                    let charText = textSource[k % textSource.length];
+                                    n.lastDrawnChars.push({ x: ptX, y: ptY, char: charText, size: fontSize, hasBlob: hasBlob });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let c = 2 * Math.PI * n.r;
+                let currentDist = 0;
+                let k = 0;
+                while (currentDist < c) {
+                    let seedA = n.id * 1000;
+                    let seedB = k;
+                    let r = getRadius(seedA, seedB);
+                    let totalR = r + 4; 
+                    
+                    let centerDist = currentDist + totalR;
+                    currentDist += totalR * 2 - 0.2; 
+                    
+                    if (centerDist > c) break;
+                    
+                    let a = (centerDist / c) * Math.PI * 2;
+                    let ox = n.x + n.r * Math.cos(a);
+                    let oy = n.y + n.r * Math.sin(a);
+                    k++;
+                    
+                    let isClipped = false;
+                    for (let plane of planes) {
+                        let dCur = (ox - plane.px) * plane.nx + (oy - plane.py) * plane.ny;
+                        if (dCur > 0.5) { 
+                            isClipped = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!isClipped) {
+                        let seedA = n.id * 1000;
+                        let seedB = k;
+                        let r = getRadius(seedA, seedB);
+                        
+                        let hasBlob = pseudoRandom(seedA, seedB + 1111) < 0.6; 
+                        
+                        if (hasBlob) {
+                            blobCtx.fillStyle = "#ffffff"; 
+                            blobCtx.beginPath();
+                            blobCtx.arc(ox, oy, r + 4, 0, Math.PI * 2);
+                            blobCtx.fill();
+                        }
+
+                        let fontSize = Math.max(16, r * 1.8);
+                        let isOverlap = false;
+                        for (let b of drawnTextBounds) {
+                            let dx = ox - b.x; let dy = oy - b.y;
+                            if (dx*dx + dy*dy < (fontSize * 0.45 + b.r) * (fontSize * 0.45 + b.r)) { 
+                                isOverlap = true; break; 
+                            }
+                        }
+                        if (!isOverlap) {
+                            drawnTextBounds.push({x: ox, y: oy, r: fontSize * 0.45});
+                            let textSource = n.typedText && n.typedText.length > 0 ? n.typedText : " ";
+                            let charText = textSource[k % textSource.length];
+                            n.lastDrawnChars.push({ x: ox, y: oy, char: charText, size: fontSize, hasBlob: hasBlob });
+                        }
+                    }
+                }
+            });
+
+            ctx.filter = "url(#goo)";
+            ctx.drawImage(blobDom, 0, 0);
+            ctx.filter = "none";
+
+            nodes.forEach(n => {
+                if (!n.lastDrawnChars) return;
+                n.lastDrawnChars.forEach(charData => {
+                    ctx.font = `${charData.size}px 'HelveticaNeueMedium', Arial, sans-serif`;
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+
+                    if (charData.hasBlob) {
+                        ctx.globalCompositeOperation = "destination-out";
+                        ctx.fillText(charData.char, charData.x, charData.y);
+                        ctx.globalCompositeOperation = "source-over";
+                    } else {
+                        ctx.fillStyle = "#ffffff";
+                        ctx.fillText(charData.char, charData.x, charData.y);
+                    }
+                });
+            });
+
+            let hits = svg.selectAll("circle.hit").data(nodes, d => d.id);
+            let hitsEnter = hits.enter().append("circle").attr("class", "hit")
+                .attr("fill", "transparent")
+                .style("cursor", "grab")
+                .call(drag)
+                .on("wheel", (event, d) => {
+                    event.preventDefault(); 
+                    let delta = event.deltaY < 0 ? 12 : -12;
+                    d.r = Math.max(30, Math.min(400, d.r + delta));
+                    simulation.alpha(0.5).restart(); 
+                });
+                
+            hits.merge(hitsEnter)
+                .attr("cx", d => d.x).attr("cy", d => d.y).attr("r", d => d.r);
+            hits.exit().remove();
+
+            for (let i = fallingChars.length - 1; i >= 0; i--) {
+                let fc = fallingChars[i];
+                
+                fc.vy += 4; 
+                fc.x += fc.vx; 
+                fc.y += fc.vy;
+                
+                fc.vx *= 0.92;
+                
+                if (fc.y > height + 100) {
+                    fallingChars.splice(i, 1);
+                    continue;
+                }
+                
+                ctx.save();
+                ctx.translate(fc.x, fc.y);
+                
+                ctx.fillStyle = "#ffffff"; 
+                ctx.font = `${fc.size}px 'HelveticaNeueMedium', Arial, sans-serif`;
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText(fc.char, 0, 0);
+                
+                ctx.restore();
+            }
+
+            if (nodes.length === 0) {
+                introTextAlphaMultiplier = Math.min(1.0, introTextAlphaMultiplier + 0.02);
+            } else {
+                introTextAlphaMultiplier = Math.max(0.0, introTextAlphaMultiplier - 0.1);
+            }
+
+            if (introTextAlphaMultiplier > 0) {
+                let time = Date.now() * 0.001; 
+                let baseAlpha = 0.4 + 0.3 * Math.sin(time * 1.5); 
+                let finalAlpha = baseAlpha * introTextAlphaMultiplier;
+                
+                ctx.save();
+                ctx.fillStyle = `rgba(255, 255, 255, ${finalAlpha})`;
+                ctx.font = "24px 'HelveticaNeueLight', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif";
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText("Type something occupying your mind.", width / 2, height / 2);
+                ctx.restore();
+            }
+        }
+
+        const videoElement = document.getElementById('input_video');
+        const cursorElement = document.getElementById('hand-cursor');
+
+        let smoothedX = width / 2;
+        let smoothedY = height / 2;
+        let prevZ = null;
+        let prevY = null;
+        let clickCooldown = 0;
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+        
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+
+        hands.onResults((results) => {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                cursorElement.style.display = 'block';
+                const landmarks = results.multiHandLandmarks[0];
+                
+                const indexTip = landmarks[8];
+                
+                let targetX = (1 - indexTip.x) * width;
+                let targetY = indexTip.y * height;
+
+                smoothedX += (targetX - smoothedX) * 0.35;
+                smoothedY += (targetY - smoothedY) * 0.35;
+                
+                cursorElement.style.left = smoothedX + 'px';
+                cursorElement.style.top = smoothedY + 'px';
+                
+                let isClicking = false;
+                if (prevZ !== null && prevY !== null) {
+                    let dz = indexTip.z - prevZ;
+                    let dy = indexTip.y - prevY;
+                    
+                    if ((dz < -0.015 || dy > 0.02) && clickCooldown <= 0 && indexTip.z < -0.02) {
+                        isClicking = true;
+                        clickCooldown = 15; 
+                    }
+                }
+                prevZ = indexTip.z;
+                prevY = indexTip.y;
+                if (clickCooldown > 0) clickCooldown--;
+                
+                if (isClicking) {
+                    cursorElement.classList.add('pinched'); 
+                    for (let i = 0; i < nodes.length; i++) {
+                        let n = nodes[i];
+                        let dxNode = smoothedX - n.x;
+                        let dyNode = smoothedY - n.y;
+                        if (Math.sqrt(dxNode*dxNode + dyNode*dyNode) <= n.r) {
+                            burstBubble(n);
+                            break; 
+                        }
+                    }
+                } else if (clickCooldown === 0) {
+                    cursorElement.classList.remove('pinched');
+                }
+            } else {
+                cursorElement.style.display = 'none';
+            }
+        });
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        camera.start();
+
+    </script>
+</body>
+</html>
